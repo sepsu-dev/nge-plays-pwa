@@ -39,6 +39,24 @@ const err = new AudioSourceError("no-audio", "No audio stream available for this
 assert.equal(err.name, "AudioSourceError");
 assert.equal(err.code, "no-audio");
 assert.ok(err instanceof Error);
+// A plain failure carries no per-client detail and is treated as a real verdict, not a
+// transient network hiccup (so it is cached instead of being retried on every request).
+assert.equal(err.transient, false);
+assert.deepEqual(err.candidates, []);
+
+// A whole-pass failure keeps each client's verdict: the stream route returns them so a 502
+// explains itself instead of just saying "Bad Gateway".
+const summarized = new AudioSourceError("upstream-restricted", "all failed", {
+  transient: true,
+  candidates: [
+    { client: "YTMUSIC", code: "upstream-restricted", message: "206/403/403" },
+    { client: "IOS", code: "upstream-restricted", message: "206/403/403" },
+  ],
+});
+assert.equal(summarized.code, "upstream-restricted");
+assert.equal(summarized.transient, true);
+assert.equal(summarized.candidates.length, 2);
+assert.equal(summarized.candidates[1].client, "IOS");
 
 // SABR-only URLs cannot be proxied as a byte range, so they must never be cached.
 assert.equal(

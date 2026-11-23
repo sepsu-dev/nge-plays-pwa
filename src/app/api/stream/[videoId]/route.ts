@@ -63,14 +63,22 @@ function jsonError(
 ): Response {
   return Response.json(
     { error: code, message, ...extra },
-    { status, headers: { "cache-control": "no-store" } }
+    {
+      status,
+      headers: {
+        "cache-control": "no-store",
+        // Surfaces the reason on the network row, so a failed <audio> request explains
+        // itself even when the response body is never inspected.
+        "x-stream-error": code,
+      },
+    }
   );
 }
 
 /** Client-facing text for failures whose technical detail is not actionable. */
 const MESSAGES: Partial<Record<AudioSourceError["code"], string>> = {
   "upstream-restricted":
-    "YouTube refused this stream for now. Set YOUTUBE_PO_TOKEN (see README) or retry in a few minutes.",
+    "YouTube only served the first part of this stream. Retry, or set YT_PO_TOKEN_PROVIDER_URL / YOUTUBE_PO_TOKEN (see README).",
 };
 
 function buildHeaders(upstream: Response, source: AudioSource): Headers {
@@ -130,7 +138,13 @@ async function handle(request: Request, context: RouteContext, withBody: boolean
       return jsonError(
         AUDIO_SOURCE_HTTP_STATUS[err.code],
         err.code,
-        MESSAGES[err.code] ?? err.message
+        MESSAGES[err.code] ?? err.message,
+        {
+          // Every candidate's verdict: this is what turns "502 Bad Gateway" into
+          // "YouTube refused both YTMUSIC and IOS for this track".
+          ...(err.candidates.length ? { candidates: err.candidates } : {}),
+          ...(err.transient ? { transient: true } : {}),
+        }
       );
     }
     console.error("[stream] resolve failed", err);
@@ -153,9 +167,9 @@ async function handle(request: Request, context: RouteContext, withBody: boolean
       502,
       restricted ? "upstream-restricted" : "upstream-error",
       restricted
-        ? "YouTube refused this stream. If it keeps happening, set YOUTUBE_PO_TOKEN (see README)."
+        ? "YouTube only served the first part of this stream. Retry, or set YT_PO_TOKEN_PROVIDER_URL (see README)."
         : `Upstream responded with ${upstream.status}`,
-      { upstreamStatus: upstream.status, client: source.client }
+      { upstreamStatus: upstream.status, client: source.client, itag: source.itag }
     );
   }
   if (!withBody) {

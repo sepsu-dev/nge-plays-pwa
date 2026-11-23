@@ -1,5 +1,6 @@
 import type { Types } from "youtubei.js";
-import { getInnertube } from "./innertube";
+import { getInnertube, poTokenForClient } from "./innertube";
+import { potContentBinding, providerPoToken } from "./po-token";
 
 export type AudioSourceErrorCode =
   | "invalid-id"
@@ -24,13 +25,30 @@ export type AudioSourceErrorCode =
 export const AUDIO_CLIENT_CANDIDATES = ["YTMUSIC", "IOS"] as const;
 export type AudioClient = (typeof AUDIO_CLIENT_CANDIDATES)[number];
 
+/** One client's verdict, kept so a 502 can explain *why* every candidate failed. */
+export interface CandidateFailure {
+  client: AudioClient;
+  code: AudioSourceErrorCode;
+  message: string;
+}
+
 export class AudioSourceError extends Error {
   code: AudioSourceErrorCode;
+  /** A timeout / network hiccup rather than a verdict from YouTube: safe to retry soon. */
+  transient: boolean;
+  /** Per-client reasons, filled in when a whole candidate pass failed. */
+  candidates: CandidateFailure[];
 
-  constructor(code: AudioSourceErrorCode, message: string) {
+  constructor(
+    code: AudioSourceErrorCode,
+    message: string,
+    details: { transient?: boolean; candidates?: CandidateFailure[] } = {}
+  ) {
     super(message);
     this.name = "AudioSourceError";
     this.code = code;
+    this.transient = details.transient ?? false;
+    this.candidates = details.candidates ?? [];
   }
 }
 
@@ -270,10 +288,15 @@ async function attemptClient(
   { probe }: { probe: boolean }
 ): Promise<AudioSource> {
   const yt = await getInnertube();
+  // A PO token is only valid for the client (and usually the video) it was minted for, so
+  // pinning one per client is what turns a 403 into a playable URL when bypassing IP checks.
+  // A configured token wins (no round-trip); otherwise ask the provider for this video.
+  const poToken =
+    poTokenForClient(client) ?? (await providerPoToken(potContentBinding(videoId, client)));
 
   let info: VideoInfo;
   try {
-    info = await yt.getBasicInfo(videoId, { client });
+    info = await yt.getBasicInfo(videoId, poToken ? { client, po_token: poToken } : { client });
   } catch (err) {
     throw toAudioSourceError(err);
   }
@@ -308,14 +331,17 @@ async function attemptClient(
   if (probe) {
     const result = await probeSource(url, format.content_length);
     if (!result.ok) {
+      const refused = result.statuses.some((status) => [401, 403, 410].includes(status));
       // A URL that only serves its first chunk cannot be used for seeking: drop this
       // candidate for a while so the next attempt asks YouTube for a different host.
-      if (result.statuses.some((status) => [401, 403, 410].includes(status))) {
-        markCandidateFailed(videoId, client);
-      }
+      if (refused) markCandidateFailed(videoId, client);
       throw new AudioSourceError(
         "upstream-restricted",
-        `YouTube refused ${client} itag ${format.itag} ranges (${result.statuses.join("/")})`
+        `YouTube refused ${client} itag ${format.itag} ranges (${result.statuses.join("/")}; ` +
+          `po_token=${poToken ? "yes" : "no"})`,
+        // Status 0 means the probe timed out. Without a real refusal that is our network,
+        // not a restriction, so it must not be remembered as a verdict about the track.
+        { transient: !refused && result.statuses.includes(0) }
       );
     }
   }
@@ -355,36 +381,79 @@ function toAudioSourceError(err: unknown): AudioSourceError {
 /**
  * Each `getBasicInfo` call returns freshly signed URLs, and they are load-balanced
  * across googlevideo hosts: some serve the whole file, others only its first ~512KB.
- * One pass over the candidates is enough — retrying the same video in a tight loop is
- * what gets the whole IP throttled, which then looks like *every* URL is restricted.
+ *
+ * Measured on a track that reliably plays (`bun scripts/yt-clients.ts <videoId>` run in a
+ * loop): the same client alternates between `206/403/403` (restricted host) and
+ * `206/206/206` (fine) across attempts. One pass over the candidates is therefore *not*
+ * enough — that is why playback of a healthy track sometimes 502s. A pass that failed only
+ * because of restricted ranges is retried with fresh URLs, bounded so a genuinely
+ * protected track still fails fast instead of hammering YouTube (which is what gets the
+ * whole IP throttled).
  */
+const MAX_CANDIDATE_PASSES = 2;
 const MIN_FAILURE_CACHE_MS = 20_000;
 
+interface AttemptFailure {
+  client: AudioClient;
+  error: AudioSourceError;
+}
+
+/** Fold per-client failures into the detail a 502 response can show. */
+function summarize(failures: AttemptFailure[]): {
+  transient: boolean;
+  candidates: CandidateFailure[];
+} {
+  return {
+    // Only transient when *every* candidate failed for a transient reason.
+    transient: failures.length > 0 && failures.every((f) => f.error.transient),
+    candidates: failures.map(({ client, error }) => ({
+      client,
+      code: error.code,
+      message: error.message,
+    })),
+  };
+}
+
 async function resolveUncached(videoId: string, { exclude, probe }: ResolveFlags): Promise<AudioSource> {
-  const failures: AudioSourceError[] = [];
+  const failures: AttemptFailure[] = [];
   const candidates = orderCandidates({ exclude, blocked: blockedCandidates(videoId) });
 
-  for (const client of candidates) {
-    try {
-      return await attemptClient(videoId, client, { probe });
-    } catch (err) {
-      const failure = toAudioSourceError(err);
-      failures.push(failure);
-      console.warn(
-        `[audio] ${videoId} candidate ${client} failed (${failure.code}): ${failure.message}`
-      );
-      // A definite verdict from YouTube ends the search: another client cannot help.
-      if (failure.code === "unavailable" || failure.code === "age-restricted") {
-        throw failure;
+  for (let pass = 1; pass <= MAX_CANDIDATE_PASSES; pass += 1) {
+    const passStart = failures.length;
+    for (const client of candidates) {
+      try {
+        return await attemptClient(videoId, client, { probe });
+      } catch (err) {
+        const error = toAudioSourceError(err);
+        failures.push({ client, error });
+        console.warn(
+          `[audio] ${videoId} candidate ${client} failed (${error.code}): ${error.message}` +
+            (pass > 1 ? ` [pass ${pass}]` : "")
+        );
+        // A definite verdict from YouTube ends the search: another client cannot help.
+        if (error.code === "unavailable" || error.code === "age-restricted") {
+          throw new AudioSourceError(error.code, error.message, summarize(failures));
+        }
       }
     }
+    // Only a restricted range is worth retrying: another signed URL may land on a host
+    // that serves the whole file. Sign-in / no-audio verdicts belong to the track itself.
+    const passFailures = failures.slice(passStart);
+    const retryable =
+      passFailures.length > 0 &&
+      passFailures.every((f) => f.error.code === "upstream-restricted" && !f.error.transient);
+    if (!retryable) break;
   }
 
   // Prefer a specific verdict (sign-in / no audio) over the generic last failure.
-  const specific = failures.find((f) => f.code === "login-required" || f.code === "no-audio");
-  throw specific ?? failures[failures.length - 1] ?? new AudioSourceError(
-    "resolve-failed",
-    "No usable audio source"
+  const specific = failures.find(
+    (f) => f.error.code === "login-required" || f.error.code === "no-audio"
+  );
+  const chosen = specific ?? failures[failures.length - 1];
+  throw new AudioSourceError(
+    chosen?.error.code ?? "resolve-failed",
+    chosen?.error.message ?? "No usable audio source",
+    summarize(failures)
   );
 }
 
@@ -444,7 +513,12 @@ export async function resolveAudioSource(
         return fallback;
       }
       // Do not cache a verdict about the track itself; only transient upstream trouble.
-      if (error.code === "resolve-failed" || error.code === "upstream-restricted") {
+      // A transient failure (probe timeout) is likewise not cached: it says nothing about
+      // the track and caching it makes a slow network look like a blocked video.
+      if (
+        !error.transient &&
+        (error.code === "resolve-failed" || error.code === "upstream-restricted")
+      ) {
         failureCache.set(videoId, { error, until: Date.now() + MIN_FAILURE_CACHE_MS });
       }
       throw error;

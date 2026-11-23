@@ -153,6 +153,27 @@ export function useAudioPlayer({
   }, [syncPlayerAudio]);
 
   /**
+   * The proxy answers a failure with JSON explaining *why* (rate limited, upstream
+   * restricted, token missing). Read it so the user is told something actionable; a purely
+   * local failure (decode error, offline) has no JSON and keeps the generic wording.
+   */
+  const explainFailure = useCallback(async (videoId: string) => {
+    let message = "";
+    try {
+      const res = await fetch(audioStreamUrl(videoId), {
+        headers: { range: "bytes=0-1" },
+        cache: "no-store",
+      });
+      if (!res.ok) {
+        const body = (await res.json().catch(() => null)) as { message?: unknown } | null;
+        if (typeof body?.message === "string") message = body.message.trim();
+      }
+      await res.body?.cancel();
+    } catch {}
+    toast.error(message || "This track cannot be played");
+  }, []);
+
+  /**
    * Point the element at the proxy for `videoId`, seek to `startSeconds` once metadata
    * is in, and play when `autoPlay` is set.
    */
@@ -402,7 +423,8 @@ export function useAudioPlayer({
       callbacksRef.current.setIsPlaying(false);
       clock.set(resumeAt);
       callbacksRef.current.onSaveSession({ currentTime: resumeAt, isPlaying: false }, true);
-      toast.error("This track cannot be played");
+      if (videoId) void explainFailure(videoId);
+      else toast.error("This track cannot be played");
     };
 
     audio.addEventListener("loadedmetadata", handleLoadedMetadata);
@@ -436,6 +458,7 @@ export function useAudioPlayer({
     clearRetryTimer,
     clock,
     currentIndexRef,
+    explainFailure,
     queueRef,
     startSource,
     syncPlayerAudio,

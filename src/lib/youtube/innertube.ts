@@ -20,6 +20,7 @@ function create(): Promise<Innertube> {
 
   const cookie = process.env.YOUTUBE_COOKIE?.trim();
   const poToken = process.env.YOUTUBE_PO_TOKEN?.trim();
+  const visitorData = process.env.YOUTUBE_VISITOR_DATA?.trim();
   const cacheDir = process.env.YT_CACHE_DIR?.trim();
 
   return Innertube.create({
@@ -32,7 +33,22 @@ function create(): Promise<Innertube> {
     cache: cacheDir ? new UniversalCache(true, cacheDir) : new UniversalCache(false),
     ...(cookie ? { cookie } : {}),
     ...(poToken ? { po_token: poToken } : {}),
+    // A PO token is only accepted for the visitor it was minted for, so supporting one
+    // without the other would silently produce URLs that googlevideo answers with 403.
+    ...(visitorData ? { visitor_data: visitorData } : {}),
   });
+}
+
+/**
+ * PO token for one InnerTube client.
+ *
+ * `YOUTUBE_PO_TOKEN_<CLIENT>` (e.g. `YOUTUBE_PO_TOKEN_IOS`) pins the token that actually
+ * matches the client being resolved with, which is what YouTube checks; a single
+ * `YOUTUBE_PO_TOKEN` stays the fallback for the default client.
+ */
+export function poTokenForClient(client: string): string | undefined {
+  const scoped = process.env[`YOUTUBE_PO_TOKEN_${client}`]?.trim();
+  return scoped || process.env.YOUTUBE_PO_TOKEN?.trim() || undefined;
 }
 
 export async function getInnertube(): Promise<Innertube> {

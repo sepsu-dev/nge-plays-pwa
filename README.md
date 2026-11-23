@@ -57,7 +57,10 @@ A clean, fast, and ad-free web player for YouTube Music. Built with Next.js 16, 
 | Variable | Purpose |
 | --- | --- |
 | `YOUTUBE_COOKIE` | Full `Cookie` header from a signed-in YouTube session. Helps with age-restricted tracks. |
-| `YOUTUBE_PO_TOKEN` | Proof-of-Origin token. **Required for some tracks**: without it YouTube serves only the first ~512KB of a stream, so playback/seeking fails with 403. |
+| `YOUTUBE_PO_TOKEN` | Proof-of-Origin token for the session's default client. **Required for some tracks**: without it YouTube serves only the first ~512KB of a stream, so playback/seeking fails with 403. |
+| `YOUTUBE_PO_TOKEN_<CLIENT>` | PO token pinned to one InnerTube client (`YOUTUBE_PO_TOKEN_YTMUSIC`, `YOUTUBE_PO_TOKEN_IOS`, …). Tokens are client-bound, so this is what to set when the resolver plays with a client other than the default one. |
+| `YOUTUBE_VISITOR_DATA` | Visitor data the PO token was minted for. A token without its matching visitor data is rejected, so set both together. |
+| `YT_PO_TOKEN_PROVIDER_URL` | Base URL of a [bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider) server (e.g. `http://127.0.0.1:4416`). Preferred over a static token: it mints a video-bound token per track, which is what actually lifts the ~512 KB range limit. |
 | `YT_LANG` / `YT_LOCATION` | InnerTube language and region (defaults: `id` / `ID`). |
 | `YT_CACHE_DIR` | Opt in to an on-disk player-script cache. Off by default: a stale player script produces URLs that look valid but answer 403. |
 
@@ -82,17 +85,33 @@ route needs the Node.js runtime (already declared with `export const runtime = "
 
 `googlevideo` does not always hand out a URL that can serve the whole file:
 
-- **Unprotected URLs** (no PO token) are often limited to the first ~512 KB. The resolver probes
-  the start, middle and tail of every URL before caching it, so a restricted URL is rejected
-  instead of failing mid-track, and the next InnerTube client (`YTMUSIC` → `IOS`) is tried.
+- **Unprotected URLs** (no PO token) are limited to the first ~512 KB. That shows up as
+  `206/403/403` from the start/middle/tail probes — head fine, everything deeper refused. The
+  resolver rejects such a URL instead of failing mid-track, and the next InnerTube client
+  (`YTMUSIC` → `IOS`) is tried, but *no* client can serve the rest of an unprotected URL.
+  Set `YT_PO_TOKEN_PROVIDER_URL` (or a static `YOUTUBE_PO_TOKEN`) to lift the limit.
 - A stale player script, an expired signature, and per-IP throttling (caused by requesting the
   same track in a loop) all look the same from the outside: `403`. Every 403 goes through
   `src/lib/youtube/recovery.ts`, which resolves a fresh URL and, if that is not enough,
   rebuilds the Innertube session. Failures are cached for ~20 s so a retrying client cannot
   turn one bad track into hundreds of upstream requests.
+- Restriction is also *probabilistic*: googlevideo assigns a host per signed URL, and some
+  hosts serve the whole file while others stop at ~512 KB. A resolve pass that failed only on
+  restricted ranges is therefore retried once with fresh URLs (`MAX_CANDIDATE_PASSES` in
+  `src/lib/youtube/audio-source.ts`) instead of declaring the track unplayable.
 - If the error persists for many tracks, the deployment IP is being challenged: set
-  `YOUTUBE_PO_TOKEN` (a PO token for the visitor/client used by this server). Playing less
-  aggressively right after a restart also helps, because throttling is per IP and decays.
+  `YOUTUBE_PO_TOKEN` (a PO token for the visitor/client used by this server) together with
+  `YOUTUBE_VISITOR_DATA`, or set `YOUTUBE_PO_TOKEN_<CLIENT>` for the client the resolver
+  actually plays with. Playing less aggressively right after a restart also helps, because
+  throttling is per IP and decays.
+- Diagnosing one track: every error response carries its reason in the body and in the
+  `x-stream-error` header, and a resolve failure lists each candidate's verdict:
+
+  ```bash
+  curl -s -H 'Range: bytes=0-1023' http://localhost:3000/api/stream/<videoId> | jq
+  # {"error":"upstream-restricted","candidates":[{"client":"YTMUSIC","code":"upstream-restricted",
+  #  "message":"YouTube refused YTMUSIC itag 251 ranges (403/403/403)"}, …]}
+  ```
 
 Diagnostics live in `scripts/` and use the production code:
 
@@ -101,6 +120,7 @@ bun scripts/yt-resolver.ts <videoId...>   # resolve + verify seek ranges end to 
 bun scripts/yt-clients.ts <videoId>       # which InnerTube client yields a seekable URL
 bun scripts/yt-smoke.ts <videoId>         # raw decipher + ranged fetch timings
 bun scripts/yt-route-recovery.ts <videoId># forces upstream 403s through the API route
+bun scripts/yt-pot-check.ts <videoId>     # PO token provider: ping, mint, seekable or not
 ```
 
 
