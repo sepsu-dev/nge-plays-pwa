@@ -60,9 +60,13 @@ A clean, fast, and ad-free web player for YouTube Music. Built with Next.js 16, 
 | `YOUTUBE_PO_TOKEN` | Proof-of-Origin token for the session's default client. **Required for some tracks**: without it YouTube serves only the first ~512KB of a stream, so playback/seeking fails with 403. |
 | `YOUTUBE_PO_TOKEN_<CLIENT>` | PO token pinned to one InnerTube client (`YOUTUBE_PO_TOKEN_YTMUSIC`, `YOUTUBE_PO_TOKEN_IOS`, …). Tokens are client-bound, so this is what to set when the resolver plays with a client other than the default one. |
 | `YOUTUBE_VISITOR_DATA` | Visitor data the PO token was minted for. A token without its matching visitor data is rejected, so set both together. |
-| `YT_PO_TOKEN_PROVIDER_URL` | Base URL of a [bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider) server (e.g. `http://127.0.0.1:4416`). Preferred over a static token: it mints a video-bound token per track, which is what actually lifts the ~512 KB range limit. |
+| `YT_PO_TOKEN_PROVIDER_URL` | Base URL of a [bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider) server (e.g. `http://127.0.0.1:4416`). Preferred over a static token: it mints a video-bound token per track, which is what actually lifts the ~512 KB range limit. On a serverless host this must be a public HTTPS URL — `127.0.0.1` does not exist there. |
+| `YT_PO_TOKEN_PROVIDER_AUTH` | Optional value sent verbatim as the `authorization` header to the provider (shared secret in front of a self-hosted provider). |
 | `YT_LANG` / `YT_LOCATION` | InnerTube language and region (defaults: `id` / `ID`). |
-| `YT_CACHE_DIR` | Opt in to an on-disk player-script cache. Off by default: a stale player script produces URLs that look valid but answer 403. |
+| `YT_CACHE_DIR` | Opt in to an on-disk player-script cache. Off by default: a stale player script produces URLs that look valid but answer 403. Only useful on a host with a persistent filesystem (not Vercel serverless). |
+
+Copy `.env.example` to `.env.local` for local runs; the same keys go into Vercel's
+environment variables for deployments.
 
 ### How playback works
 
@@ -137,7 +141,64 @@ bun scripts/yt-clients.ts <videoId>       # which InnerTube client yields a seek
 bun scripts/yt-smoke.ts <videoId>         # raw decipher + ranged fetch timings
 bun scripts/yt-route-recovery.ts <videoId># forces upstream 403s through the API route
 bun scripts/yt-pot-check.ts <videoId>     # PO token provider: ping, mint, seekable or not
+bun scripts/yt-deploy-check.ts [url] [id] # a deployment: does /api/stream serve audio?
 ```
+
+### Deploying to Vercel (`bot-check` / "YouTube is checking this server")
+
+Vercel Functions run on shared datacenter IPs (`iad1` by default). YouTube treats that range
+as suspicious, so `getBasicInfo` answers `LOGIN_REQUIRED` — *"Sign in to confirm you're not a
+bot"* — even for tracks that play fine elsewhere. The route reports it as
+`503` + `x-stream-error: bot-check`, and the player waits (60–120 s) and retries. Without
+credentials it never heals, because every retry comes from the same flagged range.
+
+The fix is to stop resolving as an anonymous datacenter client:
+
+1. **Set a signed-in session.** From a browser signed into YouTube, copy the full `Cookie`
+   request header for `youtube.com` into `YOUTUBE_COOKIE`, and copy its
+   `VISITOR_INFO1_LIVE` value into `YOUTUBE_VISITOR_DATA`. Both are required: a PO token is
+   only accepted for the visitor it was minted for, and the resolver now ignores a token
+   that has no matching visitor data (with a warning in the function log). Use a dedicated
+   account, not your main one — a session used from a datacenter IP can be revoked.
+2. **Run a PO token provider somewhere public.** `127.0.0.1` does not exist inside a
+   function, and `YT_CACHE_DIR` does not either (the filesystem is ephemeral). Deploy
+   [bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider) to a
+   host that keeps a process alive (Fly.io, Cloud Run, a small VPS):
+
+   ```bash
+   docker run --rm -p 4416:4416 brainicism/bgutil-ytdlp-pot-provider
+   # then expose it over HTTPS, e.g. https://pot.example.com
+   curl -s https://pot.example.com/ping   # {"version":"…","server_uptime":…}
+   ```
+
+   Set `YT_PO_TOKEN_PROVIDER_URL=https://pot.example.com`, plus
+   `YT_PO_TOKEN_PROVIDER_AUTH` (`Bearer …`) if the endpoint sits behind a gateway that
+   requires a shared secret. If the provider is unreachable, resolution skips it for 60 s
+   instead of paying the 15 s timeout on every track.
+3. **Redeploy** so the new env vars are picked up (Vercel only reads them at build/runtime
+   start), then verify from your machine:
+
+   ```bash
+   bun scripts/yt-deploy-check.ts https://nge-plays-pwa.vercel.app dQw4w9WgXcQ
+   # stream: 206 … x-stream-error=- … STREAM_OK
+   ```
+
+   A `503` with `x-stream-error: bot-check` still means the deployment IP is challenged:
+   check that `YOUTUBE_COOKIE` and `YOUTUBE_VISITOR_DATA` belong to the same session and are
+   present in the **Production** environment, and that the provider answers `/ping` from
+   outside your network.
+4. **Optionally move the function closer** (Pro plan and above): Project → Settings →
+   Functions → Region, e.g. `sin1`. Latency and IP reputation differ per region, but this is
+   a mitigation, not a guarantee.
+
+Notes:
+
+- `maxDuration` is set to 300 s on `/api/stream/[videoId]`, which is the Hobby ceiling. Longer
+  values need Pro/Enterprise; the value is clamped by the platform otherwise.
+- The 90 s bot-check breaker in `src/lib/youtube/audio-source.ts` is in-memory, so a cold
+  start forgets it. That is intentional for a deployment where credentials, not backoff, are
+  what make resolution succeed.
+- Never commit `.env.local` or paste cookies into issues; rotate the cookie if it leaks.
 
 
 ### PWA / installable app

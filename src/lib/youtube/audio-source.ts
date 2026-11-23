@@ -339,7 +339,8 @@ async function attemptClient(
   // pinning one per client is what turns a 403 into a playable URL when bypassing IP checks.
   // A configured token wins (no round-trip); otherwise ask the provider for this video.
   const poToken =
-    poTokenForClient(client) ?? (await providerPoToken(potContentBinding(videoId, client)));
+    poTokenForClient(client) ??
+    (await providerPoToken(potContentBinding(videoId, client), client));
 
   let info: VideoInfo;
   try {

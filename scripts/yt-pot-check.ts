@@ -38,7 +38,7 @@ if (!ping.ok) {
 }
 
 const binding = potContentBinding(videoId, "IOS") ?? videoId;
-const token = await providerPoToken(binding);
+const token = await providerPoToken(binding, "IOS");
 console.log(`token: ${token ? `minted (${token.length} chars, binding=${binding})` : "none"}`);
 if (!token) {
   console.error("Provider returned no token; check its logs (BotGuard failures are common).");

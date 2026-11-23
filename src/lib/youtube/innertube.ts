@@ -23,6 +23,24 @@ function create(): Promise<Innertube> {
   const visitorData = process.env.YOUTUBE_VISITOR_DATA?.trim();
   const cacheDir = process.env.YT_CACHE_DIR?.trim();
 
+  // A PO token is only accepted for the visitor it was minted for. Passing one without the
+  // other produces URLs that look valid and answer 403 upstream, which is indistinguishable
+  // from "no token" except in time lost, so say so instead of failing silently.
+  if (poToken && !visitorData) {
+    console.warn(
+      "[innertube] YOUTUBE_PO_TOKEN is set without YOUTUBE_VISITOR_DATA; ignoring the token. " +
+        "Set both, or use YT_PO_TOKEN_PROVIDER_URL instead."
+    );
+  }
+  // A cookie is what turns a challenged datacenter IP into a signed-in session, but one
+  // without `VISITOR_INFO1_LIVE` is the most common half-configured setup.
+  if (cookie && !visitorData && !/VISITOR_INFO1_LIVE/i.test(cookie)) {
+    console.warn(
+      "[innertube] YOUTUBE_COOKIE looks incomplete (no VISITOR_INFO1_LIVE); " +
+        "copy the full Cookie header from a signed-in youtube.com request."
+    );
+  }
+
   return Innertube.create({
     lang: process.env.YT_LANG || "id",
     location: process.env.YT_LOCATION || "ID",
@@ -32,9 +50,7 @@ function create(): Promise<Innertube> {
     retrieve_player: true,
     cache: cacheDir ? new UniversalCache(true, cacheDir) : new UniversalCache(false),
     ...(cookie ? { cookie } : {}),
-    ...(poToken ? { po_token: poToken } : {}),
-    // A PO token is only accepted for the visitor it was minted for, so supporting one
-    // without the other would silently produce URLs that googlevideo answers with 403.
+    ...(poToken && visitorData ? { po_token: poToken } : {}),
     ...(visitorData ? { visitor_data: visitorData } : {}),
   });
 }

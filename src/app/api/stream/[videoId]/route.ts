@@ -24,6 +24,9 @@ import { getClientIp, takeRateLimit } from "@/lib/server-guard";
  */
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+// Proxying a whole track streams the body for as long as the browser keeps reading. The
+// free plan caps a function at 300 s; without this Next.js uses the platform default.
+export const maxDuration = 300;
 
 const UPSTREAM_HEADERS = {
   accept: "*/*",
