@@ -4,8 +4,12 @@ import {
   AUDIO_SOURCE_HTTP_STATUS,
   AudioSourceError,
   capExpiry,
+  challengeRetryAfterSeconds,
+  forgetChallenge,
+  isBotCheckReason,
   isProxySafeUrl,
   isVideoId,
+  markChallenged,
   orderCandidates,
   probeRanges,
 } from "./audio-source";
@@ -31,6 +35,9 @@ for (const code of ["unavailable", "no-audio"] as const) {
 for (const code of ["login-required", "age-restricted"] as const) {
   assert.equal(AUDIO_SOURCE_HTTP_STATUS[code], 403, `${code} should be 403`);
 }
+// A bot check is not a sign-in problem: the block is on the server's IP and clears itself,
+// so it must not tell the user to log in, and it must be retryable.
+assert.equal(AUDIO_SOURCE_HTTP_STATUS["bot-check"], 503);
 assert.equal(AUDIO_SOURCE_HTTP_STATUS["resolve-failed"], 502);
 // Range-restricted URLs are an upstream/CDN refusal, not a bug in the track.
 assert.equal(AUDIO_SOURCE_HTTP_STATUS["upstream-restricted"], 502);
@@ -103,5 +110,40 @@ assert.equal(rangesForTrack.length, 3, "a real track is probed at start, middle 
 assert.equal(rangesForTrack[0], "bytes=0-1023");
 assert.equal(rangesForTrack[1], "bytes=500000-501023");
 assert.equal(rangesForTrack[2], "bytes=998976-999999");
+
+// `LOGIN_REQUIRED` hides two different problems: a real sign-in/age gate, and YouTube's bot
+// check on the server's IP. Only the second must be treated as transient and backed off.
+for (const reason of [
+  "Login untuk mengonfirmasi bahwa Anda bukan bot",
+  "Sign in to confirm you're not a bot",
+  "Please verify you are not a robot",
+  "We detected unusual traffic from your network",
+]) {
+  assert.equal(isBotCheckReason(reason), true, `expected a bot check: ${reason}`);
+}
+for (const reason of [
+  "This video is age-restricted",
+  "Login untuk mengonfirmasi usia Anda",
+  "This video requires payment",
+  "This track requires sign-in",
+  "",
+]) {
+  assert.equal(isBotCheckReason(reason), false, `not a bot check: ${reason}`);
+}
+
+// The breaker makes resolution fail fast for a bounded time, then lets it through again, so
+// a challenge cannot be turned into an endless retry loop (which deepens the check).
+const challengeAt = 1_700_000_000_000;
+forgetChallenge();
+assert.equal(challengeRetryAfterSeconds(challengeAt), 0, "nothing to wait for without a check");
+markChallenged(challengeAt);
+const retryAfter = challengeRetryAfterSeconds(challengeAt);
+assert.ok(retryAfter >= 89 && retryAfter <= 90, `expected ~90s of backoff, got ${retryAfter}`);
+assert.equal(challengeRetryAfterSeconds(challengeAt + retryAfter * 1000), 0, "breaker expires");
+// A second challenge must extend the wait, never shorten it.
+markChallenged(challengeAt + 10_000);
+assert.ok(challengeRetryAfterSeconds(challengeAt + 10_000) > 80);
+forgetChallenge();
+assert.equal(challengeRetryAfterSeconds(challengeAt), 0);
 
 console.log("ALL_AUDIO_SOURCE_CHECKS_PASSED");

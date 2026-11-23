@@ -8,6 +8,13 @@ import {
   shouldAttemptBackgroundResume,
   type PendingResume,
 } from "@/lib/player-state";
+import {
+  failureFromResponse,
+  planStreamRecovery,
+  readStreamFailure,
+  recoveryNotice,
+  type StreamFailure,
+} from "@/lib/player-recovery";
 
 /**
  * HTML5 audio playback.
@@ -55,6 +62,10 @@ interface UseAudioPlayerParams {
 
 const MAX_PLAY_RETRIES = 2;
 const MAX_SOURCE_RETRIES = 1;
+// One toast per outage: every recovery attempt updates the same toast instead of stacking.
+const RECOVERY_TOAST_ID = "stream-recovery";
+// A playing element that cannot get data for this long is stuck, not buffering.
+const STALL_TIMEOUT_MS = 20_000;
 
 export function useAudioPlayer({
   currentTrack,
@@ -85,6 +96,14 @@ export function useAudioPlayer({
   const hiddenAtRef = useRef(0);
   const playRetryCountRef = useRef(0);
   const sourceRetryCountRef = useRef(0);
+  /** Automatic recoveries for the current track (reset once it actually plays). */
+  const autoRetryCountRef = useRef(0);
+  /** True while a failure is being classified / a retry is pending. */
+  const recoveringRef = useRef(false);
+  /** One toast per outage instead of one per attempt. */
+  const recoveryToastShownRef = useRef(false);
+  /** Stall watchdog: when the element last had nothing to play. */
+  const stalledSinceRef = useRef(0);
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const gestureUnlockRef = useRef<(() => void) | null>(null);
 
@@ -153,24 +172,23 @@ export function useAudioPlayer({
   }, [syncPlayerAudio]);
 
   /**
-   * The proxy answers a failure with JSON explaining *why* (rate limited, upstream
-   * restricted, token missing). Read it so the user is told something actionable; a purely
-   * local failure (decode error, offline) has no JSON and keeps the generic wording.
+   * Ask the proxy *why* a stream request failed. The route answers with JSON
+   * (`error`/`message`) plus `x-stream-error` and, for a bot check, `retry-after`, which
+   * is what lets playback back off for exactly as long as YouTube asks instead of dying.
+   * A request that succeeds here means the local element failed (decode/offline), and the
+   * policy retries it like any other transient problem.
    */
-  const explainFailure = useCallback(async (videoId: string) => {
-    let message = "";
+  const readFailure = useCallback(async (videoId: string): Promise<StreamFailure> => {
     try {
       const res = await fetch(audioStreamUrl(videoId), {
         headers: { range: "bytes=0-1" },
         cache: "no-store",
       });
-      if (!res.ok) {
-        const body = (await res.json().catch(() => null)) as { message?: unknown } | null;
-        if (typeof body?.message === "string") message = body.message.trim();
-      }
-      await res.body?.cancel();
-    } catch {}
-    toast.error(message || "This track cannot be played");
+      return await failureFromResponse(res);
+    } catch {
+      // Offline / aborted: no verdict at all, but worth retrying.
+      return readStreamFailure({ status: 0 });
+    }
   }, []);
 
   /**
@@ -192,12 +210,83 @@ export function useAudioPlayer({
     []
   );
 
+  /**
+   * Never give up while the cause can still heal.
+   *
+   * A reloaded source can fail for a reason that has nothing to do with the track: the
+   * server's IP is being challenged by YouTube (bot check, `retry-after`), the URL landed
+   * on a googlevideo host that only serves the first ~512KB, our own rate limiter kicked
+   * in, or the network dropped. The proxy resolves a brand-new signed URL on every
+   * attempt, so the player keeps the track loaded and reloads it after the delay the
+   * server asked for. Only a verdict about the track stops playback.
+   */
+  const recoverStream = useCallback(
+    async (videoId: string, resumeAt: number, wasPlaying: boolean) => {
+      const failure = await readFailure(videoId);
+      // The user may have paused, or another track may have been picked, while we asked.
+      const stillWanted = () =>
+        loadedVideoIdRef.current === videoId && wantAutoPlayRef.current;
+
+      const plan = planStreamRecovery(failure, autoRetryCountRef.current);
+      if (plan.action === "retry" && !wasPlaying) {
+        // The track failed while the user was not listening: do not retry in the dark.
+        recoveringRef.current = false;
+        wantAutoPlayRef.current = false;
+        callbacksRef.current.setIsPlaying(false);
+        clock.set(resumeAt);
+        callbacksRef.current.onSaveSession({ currentTime: resumeAt, isPlaying: false }, true);
+        return;
+      }
+      if (plan.action === "retry") {
+        // Stay in "recovering" while we wait: the element holds the dead source, so this is
+        // what makes the UI/room sync report buffering instead of a finished track.
+        recoveringRef.current = true;
+        autoRetryCountRef.current += 1;
+        wantAutoPlayRef.current = true;
+        // Keep the UI on "playing": the track is still the active one and will resume.
+        callbacksRef.current.setIsPlaying(true);
+        if (!recoveryToastShownRef.current) {
+          recoveryToastShownRef.current = true;
+          toast.error(recoveryNotice(failure), { id: RECOVERY_TOAST_ID });
+        }
+        clearRetryTimer();
+        retryTimerRef.current = setTimeout(() => {
+          retryTimerRef.current = null;
+          // A new attempt is in flight from here on: a failure must be handled again.
+          recoveringRef.current = false;
+          if (!stillWanted()) return;
+          // `?r=` makes the proxy resolve a fresh URL instead of serving the failed one.
+          startSource(videoId, resumeAt, true, true);
+        }, plan.delayMs);
+        return;
+      }
+
+      // Terminal (removed, age-restricted, sign-in) or out of attempts: stop honestly.
+      wantAutoPlayRef.current = false;
+      recoveringRef.current = false;
+      callbacksRef.current.setIsPlaying(false);
+      clock.set(resumeAt);
+      callbacksRef.current.onSaveSession({ currentTime: resumeAt, isPlaying: false }, true);
+      toast.error(
+        recoveryToastShownRef.current
+          ? `Still unavailable: ${failure.message || "this track cannot be played"}`
+          : failure.message || "This track cannot be played",
+        { id: RECOVERY_TOAST_ID }
+      );
+    },
+    [clearRetryTimer, clock, readFailure, startSource]
+  );
+
   const loadVideo = useCallback(
     (videoId: string, startSeconds = 0, autoPlay = true) => {
       manualPauseAtRef.current = 0;
       clearRetryTimer();
       playRetryCountRef.current = 0;
       sourceRetryCountRef.current = 0;
+      autoRetryCountRef.current = 0;
+      recoveringRef.current = false;
+      recoveryToastShownRef.current = false;
+      stalledSinceRef.current = 0;
       clock.set(startSeconds, 0);
 
       const el = audioRef.current;
@@ -224,12 +313,31 @@ export function useAudioPlayer({
     manualPauseAtRef.current = 0;
     wantAutoPlayRef.current = true;
     playRetryCountRef.current = 0;
+    // Pressing play is a fresh start for the recovery budget: if this track already failed
+    // (and used up its attempts), the user asking again must retry instead of re-using the
+    // old verdict.
+    sourceRetryCountRef.current = 0;
+    autoRetryCountRef.current = 0;
+    recoveringRef.current = false;
+    recoveryToastShownRef.current = false;
+    stalledSinceRef.current = 0;
     clearRetryTimer();
     if (pendingResumeRef.current) pendingResumeRef.current.autoPlay = true;
 
     const el = audioRef.current;
-    if (el && el.getAttribute("src")) attemptPlay(el);
-  }, [attemptPlay, clearRetryTimer, pendingResumeRef]);
+    if (!el || !el.getAttribute("src")) return;
+    // The previous source is dead (or was abandoned while we waited to retry): reload it.
+    if (el.error) {
+      startSource(
+        loadedVideoIdRef.current,
+        Number.isFinite(el.currentTime) ? el.currentTime : 0,
+        true,
+        true
+      );
+      return;
+    }
+    attemptPlay(el);
+  }, [attemptPlay, clearRetryTimer, pendingResumeRef, startSource]);
 
   const pauseVideo = useCallback(() => {
     manualPauseAtRef.current = Date.now();
@@ -291,6 +399,9 @@ export function useAudioPlayer({
   const getPlayerState = useCallback((): number => {
     const el = audioRef.current;
     if (!readyRef.current || !el || !el.getAttribute("src")) return -1;
+    // Mid-recovery the element still holds the dead source: report "buffering" so the UI
+    // and room sync say "loading", not "stopped".
+    if (recoveringRef.current) return PLAYER_STATE.BUFFERING;
     if (el.error) return -1;
     if (el.ended) return PLAYER_STATE.ENDED;
     if (el.paused) return PLAYER_STATE.PAUSED;
@@ -337,6 +448,15 @@ export function useAudioPlayer({
       playRetryCountRef.current = 0;
       hiddenAtRef.current = 0;
       sourceRetryCountRef.current = 0;
+      // Bytes are flowing again: whatever was wrong is over, so the next failure starts
+      // with a full budget and the "retrying" toast is not left on screen.
+      autoRetryCountRef.current = 0;
+      recoveringRef.current = false;
+      stalledSinceRef.current = 0;
+      if (recoveryToastShownRef.current) {
+        recoveryToastShownRef.current = false;
+        toast.dismiss(RECOVERY_TOAST_ID);
+      }
       syncPlayerAudio();
       callbacksRef.current.setIsPlaying(true);
       const current = audio.currentTime || 0;
@@ -346,8 +466,10 @@ export function useAudioPlayer({
     };
 
     const handlePause = () => {
-      // Fires while swapping sources; the new track is not "paused by the user".
-      if (loadingTargetIdRef.current || audio.ended) return;
+      // Fires while swapping sources, and while the source is dead: an errored or
+      // recovering element is not "paused by the user", and reacting to it here would
+      // cancel the automatic recovery before it gets a chance to reload.
+      if (loadingTargetIdRef.current || audio.ended || audio.error || recoveringRef.current) return;
 
       const now = Date.now();
       const isHidden = document.visibilityState === "hidden";
@@ -411,20 +533,27 @@ export function useAudioPlayer({
       const resumeAt = Number.isFinite(audio.currentTime) ? audio.currentTime : 0;
       const wasPlaying = wantAutoPlayRef.current || optsRef.current.isPlaying;
 
-      // One silent retry: the proxy re-resolves the upstream URL, so a transient 403
-      // (expired googlevideo URL) or a dropped connection usually heals itself.
-      if (videoId && sourceRetryCountRef.current < MAX_SOURCE_RETRIES) {
+      if (!videoId) {
+        wantAutoPlayRef.current = false;
+        callbacksRef.current.setIsPlaying(false);
+        toast.error("This track cannot be played");
+        return;
+      }
+
+      // One silent retry first: it costs nothing, and a stale googlevideo URL or a dropped
+      // connection is usually cured by a freshly resolved one.
+      if (sourceRetryCountRef.current < MAX_SOURCE_RETRIES) {
         sourceRetryCountRef.current += 1;
         startSource(videoId, resumeAt, wasPlaying, true);
         return;
       }
 
-      wantAutoPlayRef.current = false;
-      callbacksRef.current.setIsPlaying(false);
-      clock.set(resumeAt);
-      callbacksRef.current.onSaveSession({ currentTime: resumeAt, isPlaying: false }, true);
-      if (videoId) void explainFailure(videoId);
-      else toast.error("This track cannot be played");
+      // Still failing: find out why, then keep the track alive while the cause can heal
+      // (bot check, restricted host, rate limit, flaky network) instead of dropping the
+      // whole queue on one bad minute.
+      if (recoveringRef.current) return;
+      recoveringRef.current = true;
+      void recoverStream(videoId, resumeAt, wasPlaying);
     };
 
     audio.addEventListener("loadedmetadata", handleLoadedMetadata);
@@ -458,8 +587,8 @@ export function useAudioPlayer({
     clearRetryTimer,
     clock,
     currentIndexRef,
-    explainFailure,
     queueRef,
+    recoverStream,
     startSource,
     syncPlayerAudio,
   ]);
@@ -475,6 +604,12 @@ export function useAudioPlayer({
     const startSec = matchesResume ? Math.max(0, resume.seekTo) : 0;
     const autoPlay = matchesResume ? resume.autoPlay : optsRef.current.isPlaying;
     if (matchesResume) pendingResumeRef.current = null;
+    // A new track starts with a clean recovery budget, never inheriting the previous one.
+    sourceRetryCountRef.current = 0;
+    autoRetryCountRef.current = 0;
+    recoveringRef.current = false;
+    recoveryToastShownRef.current = false;
+    stalledSinceRef.current = 0;
     startSource(trackId, startSec, autoPlay);
   }, [currentTrack?.id, pendingResumeRef, startSource]);
 
@@ -482,6 +617,40 @@ export function useAudioPlayer({
   useEffect(() => {
     syncPlayerAudio();
   }, [volume, muted, syncPlayerAudio]);
+
+  /**
+   * A dropped upstream connection does not always fire `error`: the element can sit at
+   * "playing, no data" indefinitely (common on mobile after a network switch or when the
+   * proxy's upstream stalls). Watch for it and reload from the current position, so the
+   * track continues instead of freezing for good.
+   */
+  useEffect(() => {
+    const timer = setInterval(() => {
+      const el = audioRef.current;
+      if (!el || !el.getAttribute("src") || el.error) return;
+      if (!wantAutoPlayRef.current || el.paused || el.ended) {
+        stalledSinceRef.current = 0;
+        return;
+      }
+      // A reload/seek already has a fresh request in flight; `error` handles real failures.
+      if (loadingTargetIdRef.current || retryTimerRef.current) return;
+      if (el.readyState >= 3) {
+        stalledSinceRef.current = 0;
+        return;
+      }
+      const now = Date.now();
+      if (!stalledSinceRef.current) {
+        stalledSinceRef.current = now;
+        return;
+      }
+      if (now - stalledSinceRef.current < STALL_TIMEOUT_MS) return;
+      stalledSinceRef.current = 0;
+      const at = Number.isFinite(el.currentTime) ? el.currentTime : 0;
+      console.warn("[audio] no data for", STALL_TIMEOUT_MS, "ms; reloading from", at);
+      startSource(loadedVideoIdRef.current, at, true, true);
+    }, 5000);
+    return () => clearInterval(timer);
+  }, [startSource]);
 
   // Advance the shared clock from the element's real position.
   useEffect(() => {

@@ -6,6 +6,7 @@ export type AudioSourceErrorCode =
   | "invalid-id"
   | "unavailable"
   | "login-required"
+  | "bot-check"
   | "age-restricted"
   | "no-audio"
   | "upstream-restricted"
@@ -57,11 +58,57 @@ export const AUDIO_SOURCE_HTTP_STATUS: Record<AudioSourceErrorCode, number> = {
   "invalid-id": 400,
   unavailable: 404,
   "login-required": 403,
+  // Not 403: the user does not need to sign in, this server's IP is being challenged and
+  // the block clears itself. 503 + retry-after says exactly that.
+  "bot-check": 503,
   "age-restricted": 403,
   "no-audio": 404,
   "upstream-restricted": 502,
   "resolve-failed": 502,
 };
+
+/**
+ * `LOGIN_REQUIRED` covers two very different failures: a real sign-in / age gate for the
+ * track, and YouTube's bot check on the requesting IP ("Sign in to confirm you're not a
+ * bot" / "Login untuk mengonfirmasi bahwa Anda bukan bot"). The reason is localized by
+ * `YT_LANG`, so it is matched in several languages — `bot\b` also matches the Indonesian
+ * wording, whose sentence ends in "bot".
+ */
+export function isBotCheckReason(reason: string): boolean {
+  return /bot\b|robot|unusual traffic|verify|not a robot/i.test(reason);
+}
+
+/**
+ * YouTube's bot check is per IP and decays with time, and every extra resolution while it is
+ * active deepens it. A challenge therefore opens this breaker: resolution fails fast instead
+ * of probing again. It gates *resolution only* — a track that already has a cached URL keeps
+ * streaming, which is why the check lives here rather than in the route or the player.
+ */
+const CHALLENGE_COOLDOWN_MS = 90_000;
+let challengedUntil = 0;
+
+export function markChallenged(now = Date.now()): void {
+  challengedUntil = Math.max(challengedUntil, now + CHALLENGE_COOLDOWN_MS);
+}
+
+/** Seconds until resolution may be attempted again, or 0 when no challenge is active. */
+export function challengeRetryAfterSeconds(now = Date.now()): number {
+  const remaining = challengedUntil - now;
+  return remaining > 0 ? Math.ceil(remaining / 1000) : 0;
+}
+
+/** Drop the breaker state (test/ops hook). */
+export function forgetChallenge(): void {
+  challengedUntil = 0;
+}
+
+function activeChallenge(): AudioSourceError | null {
+  const retryAfter = challengeRetryAfterSeconds();
+  if (!retryAfter) return null;
+  return new AudioSourceError("bot-check", `YouTube bot check on this IP (retry in ${retryAfter}s)`, {
+    transient: true,
+  });
+}
 
 export interface AudioSource {
   videoId: string;
@@ -304,8 +351,18 @@ async function attemptClient(
   const status = info.playability_status?.status;
   if (status === "LOGIN_REQUIRED") {
     const reason = info.playability_status?.reason || "";
-    if (/age/i.test(reason)) {
+    // Checked before the bot check: an age gate also says "confirm", and Indonesian says
+    // "konfirmasi usia", so the two must not be confused.
+    if (/age\b|usia|umur/i.test(reason)) {
       throw new AudioSourceError("age-restricted", "This track is age restricted");
+    }
+    if (isBotCheckReason(reason)) {
+      markChallenged();
+      throw new AudioSourceError(
+        "bot-check",
+        `YouTube bot check on this IP: ${reason || "no reason given"}`,
+        { transient: true }
+      );
     }
     throw new AudioSourceError("login-required", reason || "This track requires sign-in");
   }
@@ -372,6 +429,12 @@ function toAudioSourceError(err: unknown): AudioSourceError {
   if (/unavailable|not available|does not exist|removed|private/i.test(message)) {
     return new AudioSourceError("unavailable", message || "Track unavailable");
   }
+  // Bot check before the sign-in check: its reason usually contains "sign in" too, and the
+  // two need opposite handling (back off vs. supply a cookie).
+  if (isBotCheckReason(message)) {
+    markChallenged();
+    return new AudioSourceError("bot-check", message || "YouTube bot check", { transient: true });
+  }
   if (/login_required|sign in|login required/i.test(message)) {
     return new AudioSourceError("login-required", message || "This track requires sign-in");
   }
@@ -390,8 +453,12 @@ function toAudioSourceError(err: unknown): AudioSourceError {
  * protected track still fails fast instead of hammering YouTube (which is what gets the
  * whole IP throttled).
  */
-const MAX_CANDIDATE_PASSES = 2;
+const MAX_CANDIDATE_PASSES = 3;
 const MIN_FAILURE_CACHE_MS = 20_000;
+// A pass can fail inside one throttle bucket; spacing passes out lands them in another.
+const PASS_GAP_MS = 350;
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 interface AttemptFailure {
   client: AudioClient;
@@ -415,10 +482,19 @@ function summarize(failures: AttemptFailure[]): {
 }
 
 async function resolveUncached(videoId: string, { exclude, probe }: ResolveFlags): Promise<AudioSource> {
+  // A challenged IP stays challenged for a while; asking again immediately is what turns a
+  // minute-long block into a long one, so resolution fails fast until the breaker expires.
+  // (Cached URLs are untouched: this function only runs on a cache miss or explicit refresh.)
+  const challenged = activeChallenge();
+  if (challenged) {
+    console.warn(`[audio] ${videoId} skipped: ${challenged.message}`);
+    throw challenged;
+  }
+
   const failures: AttemptFailure[] = [];
   const candidates = orderCandidates({ exclude, blocked: blockedCandidates(videoId) });
 
-  for (let pass = 1; pass <= MAX_CANDIDATE_PASSES; pass += 1) {
+  passes: for (let pass = 1; pass <= MAX_CANDIDATE_PASSES; pass += 1) {
     const passStart = failures.length;
     for (const client of candidates) {
       try {
@@ -434,6 +510,8 @@ async function resolveUncached(videoId: string, { exclude, probe }: ResolveFlags
         if (error.code === "unavailable" || error.code === "age-restricted") {
           throw new AudioSourceError(error.code, error.message, summarize(failures));
         }
+        // A bot check is IP-wide and every extra request deepens it: stop right here.
+        if (error.code === "bot-check") break passes;
       }
     }
     // Only a restricted range is worth retrying: another signed URL may land on a host
@@ -443,13 +521,19 @@ async function resolveUncached(videoId: string, { exclude, probe }: ResolveFlags
       passFailures.length > 0 &&
       passFailures.every((f) => f.error.code === "upstream-restricted" && !f.error.transient);
     if (!retryable) break;
+    if (pass < MAX_CANDIDATE_PASSES) await sleep(PASS_GAP_MS);
   }
 
-  // Prefer a specific verdict (sign-in / no audio) over the generic last failure.
-  const specific = failures.find(
-    (f) => f.error.code === "login-required" || f.error.code === "no-audio"
-  );
-  const chosen = specific ?? failures[failures.length - 1];
+  // Report the most actionable verdict: an IP challenge explains every candidate failing at
+  // once, then a definite verdict about the track, then sign-in / no-audio, and only then a
+  // per-URL range restriction (the most likely thing to heal on its own).
+  const pick = (...codes: AudioSourceErrorCode[]) =>
+    failures.find((f) => codes.includes(f.error.code));
+  const chosen =
+    pick("bot-check") ??
+    pick("age-restricted", "unavailable") ??
+    pick("login-required", "no-audio") ??
+    failures[failures.length - 1];
   throw new AudioSourceError(
     chosen?.error.code ?? "resolve-failed",
     chosen?.error.message ?? "No usable audio source",

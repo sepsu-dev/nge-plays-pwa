@@ -97,13 +97,29 @@ route needs the Node.js runtime (already declared with `export const runtime = "
   turn one bad track into hundreds of upstream requests.
 - Restriction is also *probabilistic*: googlevideo assigns a host per signed URL, and some
   hosts serve the whole file while others stop at ~512 KB. A resolve pass that failed only on
-  restricted ranges is therefore retried once with fresh URLs (`MAX_CANDIDATE_PASSES` in
-  `src/lib/youtube/audio-source.ts`) instead of declaring the track unplayable.
+  restricted ranges is therefore retried with fresh URLs — spaced out, because a throttled IP
+  can restrict several URLs in a row (`MAX_CANDIDATE_PASSES` / `PASS_GAP_MS` in
+  `src/lib/youtube/audio-source.ts`) — instead of declaring the track unplayable.
+- **“Login untuk mengonfirmasi bahwa Anda bukan bot” / “Sign in to confirm you're not a
+  bot”** is *not* a missing sign-in: it is YouTube's bot check on the server's IP, usually
+  after a burst of resolutions. It is reported as `bot-check` (`503` + `retry-after`), and
+  resolution backs off for 90 s instead of retrying into it — tracks whose URL is already
+  cached keep playing. To stop it happening in the first place, set `YOUTUBE_COOKIE`
+  (signed-in session) and/or `YT_PO_TOKEN_PROVIDER_URL`.
 - If the error persists for many tracks, the deployment IP is being challenged: set
   `YOUTUBE_PO_TOKEN` (a PO token for the visitor/client used by this server) together with
   `YOUTUBE_VISITOR_DATA`, or set `YOUTUBE_PO_TOKEN_<CLIENT>` for the client the resolver
   actually plays with. Playing less aggressively right after a restart also helps, because
   throttling is per IP and decays.
+- **Playback recovers on its own.** A stream request that 403s is retried inside the route
+  (fresh signed URL, up to `MAX_UPSTREAM_ATTEMPTS`), and the player's `<audio>` element is
+  never allowed to die on a cause that heals: the client reads `x-stream-error` /
+  `retry-after` from the failed request, waits exactly as long as the proxy asks (bot check:
+  ~90 s, otherwise 3 s → 30 s backoff), and reloads the track from the same position — up to
+  `MAX_AUTO_RETRIES` times (`src/lib/player-recovery.ts`). A watchdog also reloads a stream
+  that stops delivering data without firing an error (network switch, suspended mobile tab).
+  Only verdicts about the track itself (`unavailable`, `age-restricted`, `login-required`,
+  `no-audio`) stop playback, with the real reason shown.
 - Diagnosing one track: every error response carries its reason in the body and in the
   `x-stream-error` header, and a resolve failure lists each candidate's verdict:
 

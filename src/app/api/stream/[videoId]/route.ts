@@ -1,6 +1,7 @@
 import {
   AUDIO_SOURCE_HTTP_STATUS,
   AudioSourceError,
+  challengeRetryAfterSeconds,
   isVideoId,
   resolveAudioSource,
   type AudioSource,
@@ -32,6 +33,9 @@ const UPSTREAM_HEADERS = {
 const MAX_CLIENT_TTL_SECONDS = 3600;
 const RATE_LIMIT_PER_MINUTE = 240;
 const STALE_STATUSES = [401, 403, 410];
+// A stale or range-limited URL is replaced with a freshly signed one; two recoveries are
+// enough to land on a host that serves the whole file without hammering YouTube.
+const MAX_UPSTREAM_ATTEMPTS = 3;
 // A client retry (`?r=1`) should get a genuinely fresh URL, but not faster than this.
 const FORCED_REFRESH_COOLDOWN_MS = 2000;
 const MAX_REFRESH_KEYS = 500;
@@ -59,26 +63,26 @@ function jsonError(
   status: number,
   code: string,
   message: string,
-  extra: Record<string, unknown> = {}
+  extra: Record<string, unknown> = {},
+  retryAfterSeconds = 0
 ): Response {
-  return Response.json(
-    { error: code, message, ...extra },
-    {
-      status,
-      headers: {
-        "cache-control": "no-store",
-        // Surfaces the reason on the network row, so a failed <audio> request explains
-        // itself even when the response body is never inspected.
-        "x-stream-error": code,
-      },
-    }
-  );
+  const headers = new Headers({
+    "cache-control": "no-store",
+    // Surfaces the reason on the network row, so a failed <audio> request explains
+    // itself even when the response body is never inspected.
+    "x-stream-error": code,
+  });
+  // A bot check clears on its own; telling the client when keeps it from retrying into it.
+  if (retryAfterSeconds > 0) headers.set("retry-after", String(retryAfterSeconds));
+  return Response.json({ error: code, message, ...extra }, { status, headers });
 }
 
 /** Client-facing text for failures whose technical detail is not actionable. */
 const MESSAGES: Partial<Record<AudioSourceError["code"], string>> = {
   "upstream-restricted":
     "YouTube only served the first part of this stream. Retry, or set YT_PO_TOKEN_PROVIDER_URL / YOUTUBE_PO_TOKEN (see README).",
+  "bot-check":
+    "YouTube is temporarily challenging this server (bot check). Try again in a minute, or set YOUTUBE_COOKIE / YT_PO_TOKEN_PROVIDER_URL (see README).",
 };
 
 function buildHeaders(upstream: Response, source: AudioSource): Headers {
@@ -124,11 +128,20 @@ async function handle(request: Request, context: RouteContext, withBody: boolean
     source = await resolveAudioSource(videoId, forceRefresh ? { refresh: true } : undefined);
     upstream = await requestUpstream(source);
 
-    if (STALE_STATUSES.includes(upstream.status)) {
+    // A 401/403/410 is a verdict about *this URL*, not about the track: the signed URL
+    // expired, or the googlevideo host only serves the first ~512KB. Both heal with a new
+    // signed URL, so recovery is retried instead of failing the element — which is what
+    // used to stop playback mid-track. Bounded, because a genuinely protected track must
+    // fail fast rather than fan out into more upstream requests.
+    for (let attempt = 1; attempt < MAX_UPSTREAM_ATTEMPTS; attempt += 1) {
+      if (!STALE_STATUSES.includes(upstream.status)) break;
       console.warn(
-        `[stream] upstream ${upstream.status} for ${videoId} (${source.client} itag ${source.itag}); recovering`
+        `[stream] upstream ${upstream.status} for ${videoId} (${source.client} itag ${source.itag}); ` +
+          `recovering ${attempt}/${MAX_UPSTREAM_ATTEMPTS - 1}`
       );
       await upstream.body?.cancel();
+      // Excluding the client that just failed is what makes the next URL a different
+      // signer/host instead of the same restricted one.
       source = await recoverAudioSource(videoId, source.client);
       upstream = await requestUpstream(source);
     }
@@ -144,7 +157,8 @@ async function handle(request: Request, context: RouteContext, withBody: boolean
           // "YouTube refused both YTMUSIC and IOS for this track".
           ...(err.candidates.length ? { candidates: err.candidates } : {}),
           ...(err.transient ? { transient: true } : {}),
-        }
+        },
+        err.code === "bot-check" ? challengeRetryAfterSeconds() : 0
       );
     }
     console.error("[stream] resolve failed", err);

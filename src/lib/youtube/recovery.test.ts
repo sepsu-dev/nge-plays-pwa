@@ -92,6 +92,28 @@ const makeSource = (videoId: string, client: AudioSource["client"]): AudioSource
   assert.deepEqual(events, ["forget", "reset", "forget"]);
 }
 
+// 3c. A bot check is IP-level and clears itself: rebuilding the session cannot help, and
+// retrying into it is what deepens the block.
+{
+  let reset = false;
+  const recover = createRecovery({
+    forget: () => {},
+    resolve: async () => {
+      throw new AudioSourceError("bot-check", "Login untuk mengonfirmasi bahwa Anda bukan bot", {
+        transient: true,
+      });
+    },
+    reset: async () => {
+      reset = true;
+    },
+  });
+
+  await assert.rejects(() => recover("vid", "IOS"), (err: unknown) => {
+    return err instanceof AudioSourceError && err.code === "bot-check";
+  });
+  assert.equal(reset, false, "a bot check is not fixed by rebuilding the Innertube session");
+}
+
 // 4. Concurrent 403s from one <audio> element share a single recovery attempt.
 {
   let resolves = 0;
