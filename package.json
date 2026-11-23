@@ -1,0 +1,32 @@
+{
+  "name": "nge-plays",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "smoke:audio": "bun scripts/yt-smoke.ts"
+  },
+  "dependencies": {
+    "@radix-ui/react-tooltip": "^1.4.1",
+    "@tailwindcss/postcss": "^4.3.5",
+    "lucide-react": "^1.73.0",
+    "next": "16.4.6",
+    "postcss": "^8.5.33",
+    "react": "19.2.4",
+    "react-dom": "19.2.4",
+    "react-hot-toast": "^2.6.1",
+    "tailwindcss": "^4.3.5",
+    "youtubei.js": "^18.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "babel-plugin-react-compiler": "1.0.0",
+    "typescript": "^5.9.3"
+  }
+}

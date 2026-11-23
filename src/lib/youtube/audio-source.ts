@@ -1,0 +1,459 @@
+import type { Types } from "youtubei.js";
+import { getInnertube } from "./innertube";
+
+export type AudioSourceErrorCode =
+  | "invalid-id"
+  | "unavailable"
+  | "login-required"
+  | "age-restricted"
+  | "no-audio"
+  | "upstream-restricted"
+  | "resolve-failed";
+
+/**
+ * InnerTube clients that hand out plain (non-SABR) audio URLs that googlevideo
+ * accepts as a ranged GET.
+ *
+ * Order matters, and it is measured rather than guessed (`bun scripts/yt-clients.ts`):
+ *  - WEB / MWEB / ANDROID only return SABR streaming data ("No valid URL to decipher"),
+ *    which needs UMP and cannot be proxied as a single byte range.
+ *  - ANDROID_VR / TV currently answer LOGIN_REQUIRED ("confirm you're not a bot").
+ *  - IOS URLs carry no `n` parameter at all, which keeps them working even when the
+ *    cached player script is too old to transform signatures; m4a/AAC plays everywhere.
+ */
+export const AUDIO_CLIENT_CANDIDATES = ["YTMUSIC", "IOS"] as const;
+export type AudioClient = (typeof AUDIO_CLIENT_CANDIDATES)[number];
+
+export class AudioSourceError extends Error {
+  code: AudioSourceErrorCode;
+
+  constructor(code: AudioSourceErrorCode, message: string) {
+    super(message);
+    this.name = "AudioSourceError";
+    this.code = code;
+  }
+}
+
+/** HTTP status the stream route answers with for each failure mode. */
+export const AUDIO_SOURCE_HTTP_STATUS: Record<AudioSourceErrorCode, number> = {
+  "invalid-id": 400,
+  unavailable: 404,
+  "login-required": 403,
+  "age-restricted": 403,
+  "no-audio": 404,
+  "upstream-restricted": 502,
+  "resolve-failed": 502,
+};
+
+export interface AudioSource {
+  videoId: string;
+  /** Deciphered googlevideo URL. Bound to this server's IP — never expose it to clients. */
+  url: string;
+  mimeType: string;
+  contentLength?: number;
+  durationMs?: number;
+  /** InnerTube client and itag that produced this URL (used for failover and logging). */
+  client: AudioClient;
+  itag: number;
+  /** Epoch ms after which the URL is no longer valid upstream. */
+  expiresAt: number;
+}
+
+const VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
+// Refresh a minute early so a cached URL never expires mid-stream.
+const EXPIRY_SKEW_MS = 60_000;
+// Even when googlevideo allows a longer life, stop trusting a URL after an hour.
+const MAX_TTL_MS = 60 * 60 * 1000;
+const MAX_CACHED_SOURCES = 60;
+// How long a (video, client) pair that failed the probe is deprioritised.
+const CANDIDATE_COOLDOWN_MS = 10 * 60 * 1000;
+const PROBE_TIMEOUT_MS = 5000;
+const UPSTREAM_HEADERS = {
+  accept: "*/*",
+  origin: "https://www.youtube.com",
+  referer: "https://www.youtube.com/",
+};
+
+const sources = new Map<string, AudioSource>();
+const inflight = new Map<string, Promise<AudioSource>>();
+const candidateCooldown = new Map<string, number>();
+// A video that just failed is not re-attempted on every client retry: hammering the
+// same track is what gets the IP throttled by googlevideo.
+const failureCache = new Map<string, { error: AudioSourceError; until: number }>();
+
+export function isVideoId(value: string): boolean {
+  return VIDEO_ID_RE.test(value);
+}
+
+/**
+ * Candidate order for one resolve attempt: healthy clients first, then clients that
+ * failed a probe recently, then the ones the caller explicitly excluded (a fresh URL
+ * from the same client can still work, so it stays as the last resort).
+ * Pure, so the failover policy is unit-tested instead of inferred.
+ */
+export function orderCandidates({
+  exclude = [],
+  blocked = new Set<string>(),
+}: { exclude?: readonly string[]; blocked?: ReadonlySet<string> } = {}): AudioClient[] {
+  const excluded = new Set(exclude);
+  const healthy: AudioClient[] = [];
+  const cooling: AudioClient[] = [];
+  const lastResort: AudioClient[] = [];
+  for (const client of AUDIO_CLIENT_CANDIDATES) {
+    if (excluded.has(client)) lastResort.push(client);
+    else if (blocked.has(client)) cooling.push(client);
+    else healthy.push(client);
+  }
+  return [...healthy, ...cooling, ...lastResort];
+}
+
+/** A URL with `sabr=1` needs UMP segment streaming, so a plain ranged GET is refused. */
+export function isProxySafeUrl(url: string): boolean {
+  try {
+    return new URL(url).searchParams.get("sabr") !== "1";
+  } catch {
+    return false;
+  }
+}
+
+/** Never keep a URL around longer than MAX_TTL_MS, and never past its own expiry. */
+export function capExpiry(expiresAt: number, now = Date.now()): number {
+  return Math.min(expiresAt, now + MAX_TTL_MS);
+}
+
+function cooldownKey(videoId: string, client: AudioClient): string {
+  return `${videoId}:${client}`;
+}
+
+export function markCandidateFailed(videoId: string, client: AudioClient, now = Date.now()): void {
+  candidateCooldown.set(cooldownKey(videoId, client), now + CANDIDATE_COOLDOWN_MS);
+}
+
+export function blockedCandidates(videoId: string, now = Date.now()): Set<string> {
+  const blocked = new Set<string>();
+  for (const [key, until] of candidateCooldown) {
+    if (until <= now) candidateCooldown.delete(key);
+    else if (key.startsWith(`${videoId}:`)) blocked.add(key.slice(videoId.length + 1));
+  }
+  return blocked;
+}
+
+export function forgetCandidateFailures(videoId: string): void {
+  for (const key of candidateCooldown.keys()) {
+    if (key.startsWith(`${videoId}:`)) candidateCooldown.delete(key);
+  }
+}
+
+function readExpiry(url: string): number {
+  try {
+    const expire = Number(new URL(url).searchParams.get("expire"));
+    if (Number.isFinite(expire) && expire > 0) return expire * 1000;
+  } catch {}
+  return Date.now() + MAX_TTL_MS;
+}
+
+function remember(source: AudioSource): void {
+  sources.delete(source.videoId);
+  sources.set(source.videoId, source);
+  while (sources.size > MAX_CACHED_SOURCES) {
+    const oldest = sources.keys().next().value;
+    if (!oldest) break;
+    sources.delete(oldest);
+  }
+}
+
+export function forgetAudioSource(videoId: string): void {
+  sources.delete(videoId);
+}
+
+/** Forget the short-lived failure marker so the next call really retries. */
+export function forgetAudioFailure(videoId: string): void {
+  failureCache.delete(videoId);
+}
+
+/**
+ * Ranges used to verify a URL before it is cached.
+ *
+ * googlevideo serves some URLs only up to a shallow offset (≈512KB) while an otherwise
+ * identical URL for the same video serves the whole file; requesting beyond the limit
+ * answers 403. That restriction is invisible to `chooseFormat`/`decipher`, so the only
+ * reliable check is to ask for the start, the middle and the tail. Each probe is 1KB.
+ */
+export function probeRanges(contentLength?: number): string[] {
+  const ranges = ["bytes=0-1023"];
+  const size = Number(contentLength) || 0;
+  if (size > 8192) {
+    const mid = Math.floor(size * 0.5);
+    ranges.push(`bytes=${mid}-${mid + 1023}`);
+    ranges.push(`bytes=${Math.max(0, size - 1024)}-${size - 1}`);
+  }
+  return ranges;
+}
+
+export interface ProbeResult {
+  ok: boolean;
+  statuses: number[];
+}
+
+/**
+ * Cheap liveness check before a URL is cached: 1KB from the start, middle and tail
+ * through the same headers the proxy uses. A URL that only serves its first chunk
+ * still looks valid to `decipher`, and that is exactly what this catches — at resolve
+ * time, so playback can switch candidates instead of failing mid-track.
+ */
+export async function probeSource(url: string, contentLength?: number): Promise<ProbeResult> {
+  const statuses = await Promise.all(
+    probeRanges(contentLength).map(async (range) => {
+      try {
+        const res = await fetch(url, {
+          method: "GET",
+          headers: { ...UPSTREAM_HEADERS, range },
+          cache: "no-store",
+          redirect: "follow",
+          signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+        });
+        await res.body?.cancel();
+        return res.status;
+      } catch {
+        return 0;
+      }
+    })
+  );
+
+  // 206 is the expected answer; 200 means googlevideo ignored the range but served it.
+  return { ok: statuses.every((status) => status === 206 || status === 200), statuses };
+}
+
+/**
+ * Audio-only formats in preference order: AAC/m4a first (every mobile browser,
+ * including iOS Safari, can decode it), then opus/webm, then whatever is original.
+ */
+type VideoInfo = Awaited<ReturnType<Awaited<ReturnType<typeof getInnertube>>["getBasicInfo"]>>;
+type AudioFormat = ReturnType<VideoInfo["chooseFormat"]>;
+
+export interface ResolveOptions {
+  /** Ignore the memoised source and resolve a fresh URL. */
+  refresh?: boolean;
+  /** Clients that already failed for this request; they are tried last. */
+  exclude?: readonly string[];
+  /** Verify the URL with a one-byte ranged request before caching it (default true). */
+  probe?: boolean;
+}
+
+/** ResolveOptions after defaults are applied. */
+type ResolveFlags = { exclude: readonly string[]; probe: boolean };
+
+function pickAudioFormat(info: VideoInfo): AudioFormat | null {
+  const attempts = [
+    { type: "audio", format: "mp4", quality: "best" },
+    { type: "audio", format: "webm", quality: "best" },
+    { type: "audio", quality: "best" },
+  ] as const;
+
+  for (const options of attempts) {
+    try {
+      const format = info.chooseFormat(options);
+      // Segmented (live / OTF) formats need a DASH manifest and cannot be proxied as one stream.
+      if (!format.is_type_otf && format.has_audio && !format.has_video) return format;
+    } catch {}
+  }
+  return null;
+}
+
+/**
+ * Resolve one (video, client) pair. Throws an AudioSourceError describing *why* this
+ * client could not provide a usable URL, so the caller can decide to fail over.
+ */
+async function attemptClient(
+  videoId: string,
+  client: AudioClient,
+  { probe }: { probe: boolean }
+): Promise<AudioSource> {
+  const yt = await getInnertube();
+
+  let info: VideoInfo;
+  try {
+    info = await yt.getBasicInfo(videoId, { client });
+  } catch (err) {
+    throw toAudioSourceError(err);
+  }
+
+  const status = info.playability_status?.status;
+  if (status === "LOGIN_REQUIRED") {
+    const reason = info.playability_status?.reason || "";
+    if (/age/i.test(reason)) {
+      throw new AudioSourceError("age-restricted", "This track is age restricted");
+    }
+    throw new AudioSourceError("login-required", reason || "This track requires sign-in");
+  }
+  if (status === "ERROR") {
+    throw new AudioSourceError("unavailable", info.playability_status?.reason || "Track unavailable");
+  }
+  if (status && status !== "OK") {
+    throw new AudioSourceError("unavailable", info.playability_status?.reason || `Track is ${status}`);
+  }
+
+  const format = pickAudioFormat(info);
+  if (!format) throw new AudioSourceError("no-audio", "No audio stream available for this track");
+
+  const url = await format.decipher(yt.session.player).catch((err) => {
+    throw toAudioSourceError(err);
+  });
+  if (!url) throw new AudioSourceError("resolve-failed", "Failed to decipher the audio URL");
+  if (!isProxySafeUrl(url)) {
+    // SABR URLs only serve UMP segments; a ranged GET is guaranteed to fail.
+    throw new AudioSourceError("resolve-failed", "Client returned a SABR-only stream");
+  }
+
+  if (probe) {
+    const result = await probeSource(url, format.content_length);
+    if (!result.ok) {
+      // A URL that only serves its first chunk cannot be used for seeking: drop this
+      // candidate for a while so the next attempt asks YouTube for a different host.
+      if (result.statuses.some((status) => [401, 403, 410].includes(status))) {
+        markCandidateFailed(videoId, client);
+      }
+      throw new AudioSourceError(
+        "upstream-restricted",
+        `YouTube refused ${client} itag ${format.itag} ranges (${result.statuses.join("/")})`
+      );
+    }
+  }
+
+  const durationMs =
+    Number(format.approx_duration_ms) || Number(info.basic_info.duration ?? 0) * 1000 || undefined;
+
+  return {
+    videoId,
+    url,
+    mimeType: format.mime_type,
+    contentLength: format.content_length,
+    durationMs,
+    client,
+    itag: format.itag,
+    expiresAt: capExpiry(readExpiry(url)),
+  };
+}
+
+
+/**
+ * Translate library errors (InnertubeError and friends) into the route's vocabulary.
+ * Anything unrecognised stays a 502 instead of pretending the track is missing.
+ */
+function toAudioSourceError(err: unknown): AudioSourceError {
+  if (err instanceof AudioSourceError) return err;
+  const message = err instanceof Error ? err.message : String(err ?? "");
+  if (/unavailable|not available|does not exist|removed|private/i.test(message)) {
+    return new AudioSourceError("unavailable", message || "Track unavailable");
+  }
+  if (/login_required|sign in|login required/i.test(message)) {
+    return new AudioSourceError("login-required", message || "This track requires sign-in");
+  }
+  return new AudioSourceError("resolve-failed", message || "Failed to resolve audio");
+}
+
+/**
+ * Each `getBasicInfo` call returns freshly signed URLs, and they are load-balanced
+ * across googlevideo hosts: some serve the whole file, others only its first ~512KB.
+ * One pass over the candidates is enough — retrying the same video in a tight loop is
+ * what gets the whole IP throttled, which then looks like *every* URL is restricted.
+ */
+const MIN_FAILURE_CACHE_MS = 20_000;
+
+async function resolveUncached(videoId: string, { exclude, probe }: ResolveFlags): Promise<AudioSource> {
+  const failures: AudioSourceError[] = [];
+  const candidates = orderCandidates({ exclude, blocked: blockedCandidates(videoId) });
+
+  for (const client of candidates) {
+    try {
+      return await attemptClient(videoId, client, { probe });
+    } catch (err) {
+      const failure = toAudioSourceError(err);
+      failures.push(failure);
+      console.warn(
+        `[audio] ${videoId} candidate ${client} failed (${failure.code}): ${failure.message}`
+      );
+      // A definite verdict from YouTube ends the search: another client cannot help.
+      if (failure.code === "unavailable" || failure.code === "age-restricted") {
+        throw failure;
+      }
+    }
+  }
+
+  // Prefer a specific verdict (sign-in / no audio) over the generic last failure.
+  const specific = failures.find((f) => f.code === "login-required" || f.code === "no-audio");
+  throw specific ?? failures[failures.length - 1] ?? new AudioSourceError(
+    "resolve-failed",
+    "No usable audio source"
+  );
+}
+
+/**
+ * Resolve (and memoise) a playable audio URL for `videoId`.
+ *
+ * Concurrent callers share one in-flight lookup, so parallel range requests only
+ * trigger a single InnerTube round-trip. Every candidate is probe-checked before it
+ * is cached, and a client that answers 403 is deprioritised for this video for a
+ * while, which is what keeps a stale player script from turning into playback errors.
+ */
+export async function resolveAudioSource(
+  videoId: string,
+  options: ResolveOptions = {}
+): Promise<AudioSource> {
+  const { refresh = false, exclude = [], probe = true } = options;
+
+  if (!isVideoId(videoId)) {
+    throw new AudioSourceError("invalid-id", "Invalid video id");
+  }
+
+  if (!refresh) {
+    const cached = sources.get(videoId);
+    if (cached && cached.expiresAt - EXPIRY_SKEW_MS > Date.now()) return cached;
+    const failed = failureCache.get(videoId);
+    if (failed && failed.until > Date.now()) throw failed.error;
+    if (failed) failureCache.delete(videoId);
+  } else {
+    // Keep the current source: if the refresh cannot find a working URL, serving a
+    // slightly old one beats failing the request outright.
+    failureCache.delete(videoId);
+  }
+
+  const previous = sources.get(videoId);
+  const usablePrevious = () =>
+    previous && previous.expiresAt - EXPIRY_SKEW_MS > Date.now() ? previous : null;
+
+  const key = `${videoId}|${[...exclude].sort().join(",")}|${refresh ? "r" : ""}`;
+  const pending = inflight.get(key);
+  if (pending) return pending;
+
+  const task = resolveUncached(videoId, { exclude, probe })
+    .then((source) => {
+      remember(source);
+      forgetCandidateFailures(videoId);
+      failureCache.delete(videoId);
+      return source;
+    })
+    .catch((err) => {
+      const error =
+        err instanceof AudioSourceError
+          ? err
+          : new AudioSourceError("resolve-failed", err instanceof Error ? err.message : "Resolve failed");
+      const fallback = refresh ? usablePrevious() : null;
+      if (fallback) {
+        console.warn(`[audio] refresh failed for ${videoId}, keeping the previous source`);
+        return fallback;
+      }
+      // Do not cache a verdict about the track itself; only transient upstream trouble.
+      if (error.code === "resolve-failed" || error.code === "upstream-restricted") {
+        failureCache.set(videoId, { error, until: Date.now() + MIN_FAILURE_CACHE_MS });
+      }
+      throw error;
+    })
+    .finally(() => {
+      inflight.delete(key);
+    });
+
+  inflight.set(key, task);
+  return task;
+}
+
